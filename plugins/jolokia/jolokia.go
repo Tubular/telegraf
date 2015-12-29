@@ -7,6 +7,7 @@ import (
 	"io/ioutil"
 	"net/http"
 	"net/url"
+	"strings"
 
 	"github.com/influxdb/telegraf/plugins"
 )
@@ -20,8 +21,10 @@ type Server struct {
 }
 
 type Metric struct {
-	Name string
-	Jmx  string
+	Name               string
+	Jmx                string
+	MultipleMBeans     bool
+	SeriesNameOverride string
 }
 
 type JolokiaClient interface {
@@ -63,6 +66,7 @@ func (j *Jolokia) SampleConfig() string {
     name = "heap_memory_usage"
     jmx  = "/java.lang:type=Memory/HeapMemoryUsage"
 `
+// TODO: add new pieces of example config
 }
 
 func (j *Jolokia) Description() string {
@@ -75,7 +79,8 @@ func (j *Jolokia) getAttr(requestUrl *url.URL) (map[string]interface{}, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer req.Body.Close()
+	// TODO: why was this added in prev commit
+	//defer req.Body.Close()
 
 	resp, err := j.jClient.MakeRequest(req)
 	if err != nil {
@@ -109,6 +114,39 @@ func (j *Jolokia) getAttr(requestUrl *url.URL) (map[string]interface{}, error) {
 	return jsonOut, nil
 }
 
+/* flattens nested maps into a single fields map
+ * eg. if we have something like
+ *  "value": {
+ *    "Usage": {
+ *      "committed": 456,
+ *      "used": 123
+ *    }
+ *  }
+ * this will return a map like
+ * {"Usage_committed": 456, "Usage_used": 123}
+ */
+func getNestedFields(data interface{}, fieldName string) map[string]interface{} {
+	fields := make(map[string]interface{})
+	switch t := data.(type) {
+	case map[string]interface{}:
+		for key, value := range t {
+			newFieldName := key
+			if len(fieldName) > 0 {
+				newFieldName = fieldName + "_" + key
+			}
+			for new_key, new_value := range getNestedFields(value, newFieldName) {
+				fields[new_key] = new_value
+			}
+		}
+	case interface{}:
+		if len(fieldName) == 0 {
+			fieldName = "value"
+		}
+		fields[fieldName] = t
+	}
+	return fields
+}
+
 func (j *Jolokia) Gather(acc plugins.Accumulator) error {
 	context := j.Context //"/jolokia/read"
 	servers := j.Servers
@@ -119,8 +157,11 @@ func (j *Jolokia) Gather(acc plugins.Accumulator) error {
 		tags["server"] = server.Name
 		tags["port"] = server.Port
 		tags["host"] = server.Host
-		fields := make(map[string]interface{})
 		for _, metric := range metrics {
+			seriesName := "jolokia"
+			if len(metric.SeriesNameOverride) > 0 {
+				seriesName = metric.SeriesNameOverride
+			}
 
 			measurement := metric.Name
 			jmxPath := metric.Jmx
@@ -140,18 +181,53 @@ func (j *Jolokia) Gather(acc plugins.Accumulator) error {
 			if values, ok := out["value"]; ok {
 				switch t := values.(type) {
 				case map[string]interface{}:
-					for k, v := range t {
-						fields[measurement+"_"+k] = v
+					if metric.MultipleMBeans {
+						measurements := make(map[string]map[string]interface{})
+						measurementTags := make(map[string]map[string]string)
+
+						// parse out mbean properties as tags and add a meauserment for each mbean
+						for beanName, attributes := range t {
+							groupName := ""
+							measurementName := ""
+
+							beanName = strings.Replace(beanName, " ", "_", -1)
+							properties := strings.Split(beanName[1 + strings.Index(beanName, ":"):], ",")
+							beanTags := map[string]string {}
+							for k, v := range tags {
+								beanTags[k] = v
+							}
+							for _, v := range properties {
+								tag := strings.Split(v, "=")
+								if tag[0] == "name" {
+									measurementName = tag[1]
+									continue
+								}
+								groupName += tag[1]
+								beanTags[tag[0]] = tag[1]
+							}
+
+							for k, v := range getNestedFields(attributes, measurementName) {
+								if _, ok := measurements[groupName]; !ok {
+									measurements[groupName] = make(map[string]interface{})
+								}
+								measurements[groupName][k] = v
+							}
+							measurementTags[groupName] = beanTags
+						}
+						for groupName, measurement := range measurements {
+							acc.AddFields(seriesName, measurement, measurementTags[groupName])
+						}
+					} else {
+						acc.AddFields(seriesName, getNestedFields(t, measurement), tags)
 					}
 				case interface{}:
-					fields[measurement] = t
+					acc.AddFields(seriesName, getNestedFields(t, measurement), tags)
 				}
 			} else {
 				fmt.Printf("Missing key 'value' in '%s' output response\n",
 					requestUrl.String())
 			}
 		}
-		acc.AddFields("jolokia", fields, tags)
 	}
 
 	return nil
